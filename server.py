@@ -562,6 +562,80 @@ def remove_playlist():
         logger.error(f"Error in remove_playlist for {session_id}: {e}")
         return jsonify({'error': str(e)}), 400
 
+# Add this new endpoint to your server.py, right after the play_next_song endpoint:
+
+@app.route('/api/spotify/get-next-track/<playlist_id>')
+def get_next_track(playlist_id):
+    """
+    Get next track data without playing it (for SDK usage)
+    """
+    session_id = request.args.get('session_id')
+    if not session_id:
+        logger.error("No session_id provided in get_next_track")
+        return jsonify({'error': 'Session ID required'}), 400
+    
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session:
+            logger.error(f"Invalid session_id in get_next_track: {session_id}")
+            return jsonify({'error': 'Invalid session_id'}), 400
+        
+        # Update playlist theme
+        result = sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$set': {'playlist_theme': playlist_id}}
+        )
+        logger.info(f"Updated playlist_theme for session {session_id}, modified: {result.modified_count}")
+        
+        tracks_list = get_playlist_tracks(playlist_id, session_id)
+        if not tracks_list:
+            logger.error(f"No tracks available for playlist {playlist_id}")
+            return jsonify({'error': f'No tracks available for playlist {playlist_id}. Playlist may be empty or inaccessible.'}), 400
+        
+        random_track = random.choice(tracks_list)
+        
+        # Get track metadata
+        spotify_year = int(random_track['album']['release_date'].split('-')[0])
+        track_name = random_track['name']
+        artist_name = random_track['artists'][0]['name']
+        album_name = random_track['album']['name']
+        original_year = get_original_release_year(track_name, artist_name, album_name, spotify_year)
+        
+        # Store track data
+        tracks.insert_one({
+            'spotify_id': random_track['id'],
+            'title': track_name,
+            'artist': artist_name,
+            'album': album_name,
+            'release_year': original_year,
+            'playlist_theme': playlist_id,
+            'played_at': datetime.utcnow().isoformat(),
+            'session_id': str(session['_id']),
+            'expires_at': datetime.utcnow() + timedelta(hours=2)
+        })
+        
+        # Update tracks played
+        result = sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$push': {'tracks_played': random_track['id']}}
+        )
+        logger.info(f"Prepared track {random_track['id']} for session {session_id}, modified: {result.modified_count}")
+        
+        return jsonify({
+            'spotify_id': random_track['id'],
+            'title': track_name,
+            'artist': artist_name,
+            'release_year': original_year,
+            'album': album_name,
+            'playlist_theme': playlist_id,
+            'played_at': datetime.utcnow().isoformat(),
+            'track_uri': f"spotify:track:{random_track['id']}"  # This is what the SDK needs
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_next_track for {session_id}: {e}")
+        return jsonify({'error': str(e)}), 400
+
 @app.route('/api/spotify/update-playlist-icon', methods=['POST'])
 def update_playlist_icon():
     session_id = request.args.get('session_id')
