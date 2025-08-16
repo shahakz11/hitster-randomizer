@@ -234,7 +234,7 @@ def spotify_callback():
             }}
         )
         
-        return redirect(f"{FRONTEND_URL}?session_id={str(session['_id']}")
+        return redirect(f"{FRONTEND_URL}?session_id={str(session['_id'])}")
         
     except Exception as e:
         logger.error(f"Callback failed: {str(e)}", exc_info=True)
