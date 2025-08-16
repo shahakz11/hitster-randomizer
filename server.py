@@ -1,6 +1,6 @@
 import os
 import re
-import time  # This imports the time module
+import time
 from flask import Flask, request, jsonify, redirect, g
 from flask_cors import CORS
 import requests
@@ -46,61 +46,60 @@ VALID_ICONS = [
 ]
 DEFAULT_ICON = 'music-note'
 
-# MongoDB setup
-try:
-    mongodb = MongoClient(
-        MONGO_URI,
-        connectTimeoutMS=10000,
-        socketTimeoutMS=30000,
-        maxPoolSize=10,
-        retryWrites=True,
-        retryReads=True
-    )
-    
-    # Test connection with simple command
-    mongodb.admin.command('ping')
-    logger.info("MongoDB connected successfully")
-    
-    db = mongodb['hitster']
-    sessions = db['sessions']
-    tracks = db['tracks']
-    playlists = db['playlists']
-    playlist_tracks = db['playlist_tracks']
-    track_metadata = db['track_metadata']
-    
-    # Create indexes with error handling
-    try:
-        tracks.create_index(
-            [("expires_at", 1)],
-            expireAfterSeconds=7200,
-            partialFilterExpression={"expires_at": {"$exists": True}}
-        )
-        playlist_tracks.create_index([("playlist_id", 1)], unique=True)
-        track_metadata.create_index([("track_name", 1), ("artist_name", 1)], unique=True)
-        
-        # Modified session indexes to handle null states
-        sessions.create_index(
-            [("state", 1)],
-            unique=True,
-            partialFilterExpression={"state": {"$type": "string"}}  # Only index non-null strings
-        )
-        sessions.create_index(
-            [("token_expires_at", 1)],
-            expireAfterSeconds=0
-        )
-        
-        logger.info("MongoDB indexes ensured")
-    except Exception as index_error:
-        logger.warning(f"Index creation warning: {str(index_error)}")
+# MongoDB setup with fork-safe configuration
+mongodb = None
 
-except Exception as e:
-    logger.error(f"MongoDB connection failed: {str(e)}")
-    raise
+def init_db():
+    global mongodb
+    try:
+        mongodb = MongoClient(
+            MONGO_URI,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=30000,
+            maxPoolSize=10,
+            retryWrites=True,
+            retryReads=True,
+            connect=False  # Critical for fork safety
+        )
+        
+        # Verify connection works
+        mongodb.admin.command('ping')
+        logger.info("MongoDB connected successfully")
+        
+        db = mongodb['hitster']
+        
+        # Create indexes with error handling
+        try:
+            db.sessions.create_index(
+                [("state", 1)],
+                unique=True,
+                partialFilterExpression={"state": {"$type": "string"}}
+            )
+            db.sessions.create_index(
+                [("token_expires_at", 1)],
+                expireAfterSeconds=0
+            )
+            logger.info("MongoDB indexes ensured")
+        except Exception as e:
+            logger.warning(f"Index creation warning: {str(e)}")
+            
+        return db
+        
+    except Exception as e:
+        logger.error(f"MongoDB connection failed: {str(e)}")
+        raise
+
+db = init_db()
+sessions = db['sessions']
+tracks = db['tracks']
+playlists = db['playlists']
+playlist_tracks = db['playlist_tracks']
+track_metadata = db['track_metadata']
 
 # Middleware
 @app.before_request
 def start_timer():
-    g.start_time = time.time()  # Changed from time() to time.time()
+    g.start_time = time.time()
 
 @app.before_request
 def check_db_connection():
@@ -113,67 +112,30 @@ def check_db_connection():
 @app.after_request
 def log_request(response):
     if request.path.startswith('/api/'):
-        duration = (time.time() - g.get('start_time', time.time())) * 1000  # Fixed time.time()
+        duration = (time.time() - g.get('start_time', time.time())) * 1000
         logger.info(
             f"{request.method} {request.path} - {response.status_code} "
             f"- {duration:.1f}ms"
         )
     return response
 
-# Helper functions
-def get_client_credentials_token():
-    try:
-        response = requests.post(
-            'https://accounts.spotify.com/api/token',
-            data={'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET},
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json().get('access_token')
-    except requests.RequestException as e:
-        logger.error(f"Client credentials error: {str(e)}")
-        return None
-
-def refresh_access_token(session_id):
-    try:
-        session = sessions.find_one({'_id': ObjectId(session_id)})
-        if not session or not session.get('spotify_refresh_token'):
-            logger.error(f"No refresh token for session {session_id}")
-            return False
-        
-        response = requests.post(
-            'https://accounts.spotify.com/api/token',
-            data={
-                'grant_type': 'refresh_token',
-                'refresh_token': session['spotify_refresh_token'],
-                'client_id': CLIENT_ID,
-                'client_secret': CLIENT_SECRET
-            },
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        updates = {
-            'spotify_access_token': data['access_token'],
-            'token_expires_at': datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600))
-        }
-        
-        if data.get('refresh_token'):
-            updates['spotify_refresh_token'] = data['refresh_token']
-        
-        sessions.update_one({'_id': ObjectId(session_id)}, {'$set': updates})
-        return True
-        
-    except Exception as e:
-        logger.error(f"Token refresh failed: {str(e)}")
-        return False
-
-# Routes
+# Spotify Authorization Flow
 @app.route('/api/spotify/authorize')
 def spotify_authorize():
     try:
         state = str(random.randint(100000, 999999))
+        
+        # Clean up any existing session with this state
+        sessions.delete_one({'state': state})
+        
+        # Create new session
+        session_id = sessions.insert_one({
+            'state': state,
+            'created_at': datetime.utcnow(),
+            'is_active': False,
+            'tracks_played': []
+        }).inserted_id
+        
         params = {
             'client_id': CLIENT_ID,
             'response_type': 'code',
@@ -182,16 +144,6 @@ def spotify_authorize():
             'scope': 'streaming user-read-playback-state user-modify-playback-state user-read-email',
             'show_dialog': 'true'
         }
-        
-        # First delete any existing session with this state
-        sessions.delete_one({'state': state})
-        
-        session_id = str(sessions.insert_one({
-            'state': state,
-            'created_at': datetime.utcnow(),
-            'is_active': False,
-            'tracks_played': []
-        }).inserted_id)
         
         auth_url = f"https://accounts.spotify.com/authorize?{urlencode(params)}"
         return redirect(auth_url)
@@ -216,6 +168,7 @@ def spotify_callback():
             logger.error(f"Invalid state: {state}")
             return redirect(f"{FRONTEND_URL}?error=invalid_state")
         
+        # Exchange code for token
         response = requests.post(
             'https://accounts.spotify.com/api/token',
             data={
@@ -230,6 +183,7 @@ def spotify_callback():
         response.raise_for_status()
         data = response.json()
         
+        # Update session
         sessions.update_one(
             {'_id': session['_id']},
             {'$set': {
@@ -576,4 +530,6 @@ def index():
     return jsonify({'message': 'Hitster Song Randomizer Backend. Use the frontend to interact.'})
 
 if __name__ == '__main__':
+    # Initialize DB connection when running directly
+    init_db()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
