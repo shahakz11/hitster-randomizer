@@ -1,6 +1,6 @@
 import os
 import re
-import time
+import time  # This imports the time module
 from flask import Flask, request, jsonify, redirect, g
 from flask_cors import CORS
 import requests
@@ -100,7 +100,7 @@ except Exception as e:
 # Middleware
 @app.before_request
 def start_timer():
-    g.start_time = time()
+    g.start_time = time.time()  # Changed from time() to time.time()
 
 @app.before_request
 def check_db_connection():
@@ -113,7 +113,7 @@ def check_db_connection():
 @app.after_request
 def log_request(response):
     if request.path.startswith('/api/'):
-        duration = (time() - g.get('start_time', time())) * 1000
+        duration = (time.time() - g.get('start_time', time.time())) * 1000  # Fixed time.time()
         logger.info(
             f"{request.method} {request.path} - {response.status_code} "
             f"- {duration:.1f}ms"
