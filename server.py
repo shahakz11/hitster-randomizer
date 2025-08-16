@@ -229,8 +229,11 @@ def get_original_release_year(track_name, artist_name, album_name, fallback_year
 
 # Fetch playlist metadata
 def get_playlist_metadata(playlist_id):
-    cached = playlists.find_one({'playlist_id': playlist_id})
-    if cached and cached.get('expires_at') > datetime.utcnow():
+    cached = playlists.find_one({
+        'playlist_id': playlist_id,
+        'expires_at': {'$gt': datetime.utcnow()}
+    })
+    if cached:
         return cached['name'], cached.get('custom_icon', DEFAULT_ICON), None
     token = get_client_credentials_token()
     if not token:
@@ -251,16 +254,14 @@ def get_playlist_metadata(playlist_id):
         response.raise_for_status()
         data = response.json()
         name = data.get('name', 'Unknown Playlist')
-        result = playlists.update_one(
-            {'playlist_id': playlist_id},
-            {'$set': {
-                'playlist_id': playlist_id,
-                'name': name,
-                'custom_icon': DEFAULT_ICON,
-                'expires_at': datetime.utcnow() + timedelta(days=30),
-            }},
-            upsert=True
-        )
+        result =  playlists.update_one(
+        {'playlist_id': playlist_id},
+        {'$set': {
+            'expires_at': datetime.utcnow() + CACHE_TTL,  # Changed from days=30
+            'last_updated': datetime.utcnow()  # New field
+        }},
+        upsert=True
+    )
         logger.info(f"Updated playlist metadata for {playlist_id}, modified: {result.modified_count}")
         return name, DEFAULT_ICON, None
     except requests.RequestException as e:
