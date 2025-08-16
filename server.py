@@ -47,14 +47,19 @@ DEFAULT_ICON = 'music-note'
 
 # MongoDB setup
 try:
-    mongodb = MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=30000,
-        connectTimeoutMS=30000,
-        socketTimeoutMS=30000,
-        retryWrites=True,
-        w='majority'
-    )
+   from pymongo.server_api import ServerApi
+
+mongodb = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=30000,
+    socketTimeoutMS=30000,
+    maxPoolSize=100,  # New
+    minPoolSize=10,   # New
+    server_api=ServerApi('1'),  # New
+    retryWrites=True,
+    retryReads=True   # New
+)
     db = mongodb['hitster']
     sessions = db['sessions']
     tracks = db['tracks']
