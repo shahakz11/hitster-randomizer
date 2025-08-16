@@ -253,6 +253,132 @@ def remove_playlist():
         logger.error(f"Error in remove_playlist for {session_id}: {e}")
         return jsonify({'error': str(e)}), 400
 
+def get_playlist_tracks(playlist_id, session_id):
+    """Fetch tracks from a Spotify playlist"""
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session or not session.get('spotify_access_token'):
+            logger.error(f"No active session or access token for session {session_id}")
+            return None
+
+        headers = {
+            'Authorization': f"Bearer {session['spotify_access_token']}",
+            'Content-Type': 'application/json'
+        }
+
+        # First get the playlist to check if it's a user's playlist
+        playlist_url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
+        playlist_response = requests.get(playlist_url, headers=headers)
+        playlist_response.raise_for_status()
+        playlist_data = playlist_response.json()
+
+        # Get all tracks (handle pagination if needed)
+        tracks_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+        tracks_response = requests.get(tracks_url, headers=headers)
+        tracks_response.raise_for_status()
+        tracks_data = tracks_response.json()
+
+        # Extract track items
+        track_items = []
+        if 'items' in tracks_data:
+            track_items = [item['track'] for item in tracks_data['items'] if item['track'] is not None]
+
+        logger.info(f"Fetched {len(track_items)} tracks from playlist {playlist_id}")
+        return track_items
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error fetching playlist tracks: {str(e)}")
+        if e.response.status_code == 401:
+            # Token might be expired, try to refresh
+            refresh_token(session_id)
+            return get_playlist_tracks(playlist_id, session_id)
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching playlist tracks: {str(e)}")
+        return None
+
+def refresh_token(session_id):
+    """Refresh Spotify access token"""
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session or not session.get('spotify_refresh_token'):
+            logger.error(f"No refresh token available for session {session_id}")
+            return False
+
+        response = requests.post(
+            'https://accounts.spotify.com/api/token',
+            data={
+                'grant_type': 'refresh_token',
+                'refresh_token': session['spotify_refresh_token'],
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET
+            }
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$set': {
+                'spotify_access_token': data['access_token'],
+                'token_expires_at': datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600))
+            }}
+        )
+        logger.info(f"Refreshed token for session {session_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to refresh token for session {session_id}: {str(e)}")
+        return False
+
+def get_original_release_year(track_name, artist_name, album_name, spotify_year):
+    """Get original release year (placeholder implementation)"""
+    # In a real implementation, you might query MusicBrainz here
+    return spotify_year
+
+def play_track(track_id, session_id):
+    """Play track on user's active Spotify device"""
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session or not session.get('spotify_access_token'):
+            return False, "No active session or access token"
+
+        headers = {
+            'Authorization': f"Bearer {session['spotify_access_token']}",
+            'Content-Type': 'application/json'
+        }
+
+        # First check available devices
+        devices_response = requests.get(
+            'https://api.spotify.com/v1/me/player/devices',
+            headers=headers
+        )
+        
+        if devices_response.status_code == 204:
+            return False, "No active devices found. Open Spotify on a device."
+
+        devices = devices_response.json().get('devices', [])
+        if not devices:
+            return False, "No active devices found. Open Spotify on a device."
+
+        # Play on first available device
+        play_response = requests.put(
+            f'https://api.spotify.com/v1/me/player/play?device_id={devices[0]["id"]}',
+            headers=headers,
+            json={'uris': [f'spotify:track:{track_id}']}
+        )
+
+        if play_response.status_code == 204:
+            return True, None
+        else:
+            return False, play_response.text
+
+    except Exception as e:
+        logger.error(f"Error playing track: {str(e)}")
+        return False, str(e)
+
+
+
 # Add this new endpoint to your server.py, right after the play_next_song endpoint:
 @app.route('/api/spotify/get-next-track/<playlist_id>')
 def get_next_track(playlist_id):
