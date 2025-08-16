@@ -46,8 +46,7 @@ VALID_ICONS = [
 DEFAULT_ICON = 'music-note'
 
 # MongoDB setup
-try:
-   from pymongo.server_api import ServerApi
+from pymongo.server_api import ServerApi
 
 mongodb = MongoClient(
     MONGO_URI,
