@@ -390,6 +390,29 @@ def play_track(track_id, session_id):
         logger.error(f"Unexpected error in play_track for {session_id}: {e}")
         return False, f"Error playing track: {str(e)}"
 
+@app.route('/api/spotify/token')
+def get_spotify_token():
+    session_id = request.args.get('session_id')
+    if not session_id:
+        logger.error("No session_id provided in get_spotify_token")
+        return jsonify({'error': 'Session ID required'}), 400
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session:
+            logger.error(f"Invalid session_id in get_spotify_token: {session_id}")
+            return jsonify({'error': 'Invalid session_id'}), 400
+        token = session.get('spotify_access_token')
+        if not token or (session.get('token_expires_at') and session['token_expires_at'] < datetime.utcnow()):
+            if not refresh_access_token(session_id):
+                logger.error(f"Failed to refresh token for session {session_id}")
+                return jsonify({'error': 'Authentication required'}), 401
+            session = sessions.find_one({'_id': ObjectId(session_id)})
+            token = session.get('spotify_access_token')
+        return jsonify({'access_token': token})
+    except Exception as e:
+        logger.error(f"Error in get_spotify_token for {session_id}: {e}")
+        return jsonify({'error': str(e)}), 400
+
 # Parse Spotify playlist URL
 def parse_playlist_url(url):
     pattern = r'https?://open\.spotify\.com/playlist/([0-9a-zA-Z]{22})'
