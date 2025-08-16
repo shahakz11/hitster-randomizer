@@ -57,7 +57,7 @@ try:
         retryReads=True
     )
     
-    # Test connection
+    # Test connection with simple command
     mongodb.admin.command('ping')
     logger.info("MongoDB connected successfully")
     
@@ -68,18 +68,31 @@ try:
     playlist_tracks = db['playlist_tracks']
     track_metadata = db['track_metadata']
     
-    # Create indexes
-    tracks.create_index(
-        [("expires_at", 1)],
-        expireAfterSeconds=7200,
-        partialFilterExpression={"expires_at": {"$exists": True}}
-    )
-    playlist_tracks.create_index([("playlist_id", 1)], unique=True)
-    track_metadata.create_index([("track_name", 1), ("artist_name", 1)], unique=True)
-    sessions.create_index("state", unique=True, partialFilterExpression={"state": {"$exists": True}})
-    sessions.create_index("token_expires_at", expireAfterSeconds=0)
-    
-    logger.info("MongoDB indexes ensured")
+    # Create indexes with error handling
+    try:
+        tracks.create_index(
+            [("expires_at", 1)],
+            expireAfterSeconds=7200,
+            partialFilterExpression={"expires_at": {"$exists": True}}
+        )
+        playlist_tracks.create_index([("playlist_id", 1)], unique=True)
+        track_metadata.create_index([("track_name", 1), ("artist_name", 1)], unique=True)
+        
+        # Modified session indexes to handle null states
+        sessions.create_index(
+            [("state", 1)],
+            unique=True,
+            partialFilterExpression={"state": {"$type": "string"}}  # Only index non-null strings
+        )
+        sessions.create_index(
+            [("token_expires_at", 1)],
+            expireAfterSeconds=0
+        )
+        
+        logger.info("MongoDB indexes ensured")
+    except Exception as index_error:
+        logger.warning(f"Index creation warning: {str(index_error)}")
+
 except Exception as e:
     logger.error(f"MongoDB connection failed: {str(e)}")
     raise
@@ -105,15 +118,6 @@ def log_request(response):
             f"{request.method} {request.path} - {response.status_code} "
             f"- {duration:.1f}ms"
         )
-        
-        if response.status_code < 400:
-            db.metrics.insert_one({
-                'endpoint': request.path,
-                'method': request.method,
-                'status': response.status_code,
-                'duration_ms': duration,
-                'timestamp': datetime.utcnow()
-            })
     return response
 
 # Helper functions
@@ -179,6 +183,9 @@ def spotify_authorize():
             'show_dialog': 'true'
         }
         
+        # First delete any existing session with this state
+        sessions.delete_one({'state': state})
+        
         session_id = str(sessions.insert_one({
             'state': state,
             'created_at': datetime.utcnow(),
@@ -230,7 +237,7 @@ def spotify_callback():
                 'spotify_refresh_token': data['refresh_token'],
                 'token_expires_at': datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600)),
                 'is_active': True,
-                'state': None
+                'state': None  # Clear state after use
             }}
         )
         
