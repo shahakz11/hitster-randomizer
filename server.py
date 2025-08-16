@@ -421,6 +421,8 @@ def parse_playlist_url(url):
         return match.group(1)
     return None
 
+# Replace the spotify_authorize function in your server.py with this updated version:
+
 @app.route('/api/spotify/authorize')
 def spotify_authorize():
     try:
@@ -430,7 +432,8 @@ def spotify_authorize():
             'response_type': 'code',
             'redirect_uri': REDIRECT_URI,
             'state': state,
-            'scope': 'streaming user-read-playback-state user-modify-playback-state'
+            # Fixed scopes - added user-read-email which is often required
+            'scope': 'streaming user-read-playback-state user-modify-playback-state user-read-email'
         }
         session_id = str(sessions.insert_one({
             'state': state,
@@ -563,7 +566,6 @@ def remove_playlist():
         return jsonify({'error': str(e)}), 400
 
 # Add this new endpoint to your server.py, right after the play_next_song endpoint:
-
 @app.route('/api/spotify/get-next-track/<playlist_id>')
 def get_next_track(playlist_id):
     """
@@ -635,6 +637,8 @@ def get_next_track(playlist_id):
     except Exception as e:
         logger.error(f"Error in get_next_track for {session_id}: {e}")
         return jsonify({'error': str(e)}), 400
+
+
 
 @app.route('/api/spotify/update-playlist-icon', methods=['POST'])
 def update_playlist_icon():
