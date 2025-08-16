@@ -50,14 +50,11 @@ DEFAULT_ICON = 'music-note'
 try:
     mongodb = MongoClient(
         MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-        connectTimeoutMS=30000,
+        connectTimeoutMS=10000,  # Reduced from 30000
         socketTimeoutMS=30000,
-        maxPoolSize=100,  # New
-        minPoolSize=10,   # New
-        server_api=ServerApi('1'),  # New
+        maxPoolSize=10,  # Reduced from 100
         retryWrites=True,
-        retryReads=True   # New
+        retryReads=True
     )
     db = mongodb['hitster']  # <-- Align with mongodb = MongoClient
     sessions = db['sessions']
@@ -66,7 +63,8 @@ try:
     playlist_tracks = db['playlist_tracks']
     track_metadata = db['track_metadata']
     
-    mongodb.admin.command('ping')  # Test connection
+    mongodb.admin.command('ping')
+    logger.info("MongoDB connected successfully")
     # Create TTL index on tracks.expires_at for 2-hour expiry
     tracks.create_index(
         [("expires_at", 1)],
@@ -79,7 +77,7 @@ try:
     track_metadata.create_index([("track_name", 1), ("artist_name", 1)], unique=True)
     logger.info("MongoDB connected successfully and indexes ensured")
 except Exception as e:
-    logger.error(f"MongoDB connection or index creation failed: {e}")
+    logger.error(f"MongoDB connection failed: {str(e)}")
     raise
 
 # Get Client Credentials access token
@@ -411,6 +409,14 @@ def play_track(track_id, session_id):
     except Exception as e:
         logger.error(f"Unexpected error in play_track for {session_id}: {e}")
         return False, f"Error playing track: {str(e)}"
+
+@app.before_request
+def check_db_connection():
+    try:
+        mongodb.admin.command('ping')
+    except Exception as e:
+        logger.critical(f"Database connection lost: {str(e)}")
+        return jsonify({"error": "Database unavailable"}), 503
 
 @app.after_request
 def after_request(response):
