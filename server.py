@@ -432,8 +432,8 @@ def spotify_authorize():
             'response_type': 'code',
             'redirect_uri': REDIRECT_URI,
             'state': state,
-            # Fixed scopes - added user-read-email which is often required
-            'scope': 'streaming user-read-playback-state user-modify-playback-state user-read-email'
+            # Updated scopes - added all required for Web Playback SDK
+            'scope': 'streaming user-read-playback-state user-modify-playback-state user-read-email user-read-private'
         }
         session_id = str(sessions.insert_one({
             'state': state,
