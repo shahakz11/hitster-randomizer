@@ -97,32 +97,48 @@ def refresh_access_token(session_id):
         if not session or not session.get('spotify_refresh_token'):
             logger.error(f"No refresh token for session {session_id}")
             return False
-        response = requests.post(
-            'https://accounts.spotify.com/api/token',
-            data={
-                'grant_type': 'refresh_token',
-                'refresh_token': session['spotify_refresh_token'],
-                'client_id': CLIENT_ID,
-                'client_secret': CLIENT_SECRET
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-        expires_in = data.get('expires_in', 3600)
-        result = sessions.update_one(
-            {'_id': ObjectId(session_id)},
-            {'$set': {
-                'spotify_access_token': data.get('access_token'),
-                'token_expires_at': datetime.utcnow() + timedelta(seconds=expires_in)
-            }}
-        )
-        logger.info(f"Refreshed access token for session {session_id}, modified: {result.modified_count}")
-        return True
-    except requests.RequestException as e:
-        logger.error(f"Error refreshing access token for {session_id}: {e}, Response: {response.text if 'response' in locals() else 'No response'}")
-        return False
+        
+        # Add retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    'https://accounts.spotify.com/api/token',
+                    data={
+                        'grant_type': 'refresh_token',
+                        'refresh_token': session['spotify_refresh_token'],
+                        'client_id': CLIENT_ID,
+                        'client_secret': CLIENT_SECRET
+                    },
+                    timeout=10  # Add timeout
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                # Validate token scope
+                if 'streaming' not in data.get('scope', ''):
+                    logger.error(f"Insufficient token scope in refresh: {data.get('scope')}")
+                    return False
+                
+                # Update session
+                updates = {
+                    'spotify_access_token': data['access_token'],
+                    'token_expires_at': datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600))
+                }
+                
+                # Store refresh token if a new one was provided
+                if data.get('refresh_token'):
+                    updates['spotify_refresh_token'] = data['refresh_token']
+                
+                sessions.update_one({'_id': ObjectId(session_id)}, {'$set': updates})
+                return True
+                
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(1 * (attempt + 1))  # Exponential backoff
     except Exception as e:
-        logger.error(f"Unexpected error in refresh_access_token for {session_id}: {e}")
+        logger.error(f"Token refresh failed after {max_retries} attempts: {str(e)}")
         return False
 
 # Fetch original release year from MusicBrainz
