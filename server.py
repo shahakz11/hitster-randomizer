@@ -6,6 +6,7 @@ import requests
 import random
 from urllib.parse import urlencode
 from pymongo import MongoClient
+from pymongo.server_api import ServerApi  # <-- NEW IMPORT HERE
 from bson import ObjectId
 from datetime import datetime, timedelta
 import logging
@@ -46,25 +47,25 @@ VALID_ICONS = [
 DEFAULT_ICON = 'music-note'
 
 # MongoDB setup
-from pymongo.server_api import ServerApi
-
-mongodb = MongoClient(
-    MONGO_URI,
-    serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=30000,
-    socketTimeoutMS=30000,
-    maxPoolSize=100,  # New
-    minPoolSize=10,   # New
-    server_api=ServerApi('1'),  # New
-    retryWrites=True,
-    retryReads=True   # New
-)
-    db = mongodb['hitster']
+try:
+    mongodb = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000,
+        maxPoolSize=100,  # New
+        minPoolSize=10,   # New
+        server_api=ServerApi('1'),  # New
+        retryWrites=True,
+        retryReads=True   # New
+    )
+    db = mongodb['hitster']  # <-- Align with mongodb = MongoClient
     sessions = db['sessions']
     tracks = db['tracks']
     playlists = db['playlists']
     playlist_tracks = db['playlist_tracks']
     track_metadata = db['track_metadata']
+    
     mongodb.admin.command('ping')  # Test connection
     # Create TTL index on tracks.expires_at for 2-hour expiry
     tracks.create_index(
