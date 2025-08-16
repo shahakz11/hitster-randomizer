@@ -407,6 +407,22 @@ def play_track(track_id, session_id):
         logger.error(f"Unexpected error in play_track for {session_id}: {e}")
         return False, f"Error playing track: {str(e)}"
 
+@app.after_request
+def after_request(response):
+    """Log request performance metrics"""
+    if request.path.startswith('/api/'):
+        logger.info(f"{request.method} {request.path} - {response.status_code} - {request.elapsed.total_seconds():.3f}s")
+        
+        # Store metrics in MongoDB
+        db.metrics.insert_one({
+            'endpoint': request.path,
+            'method': request.method,
+            'status': response.status_code,
+            'duration': request.elapsed.total_seconds(),
+            'timestamp': datetime.utcnow()
+        })
+    return response
+
 @app.route('/api/spotify/token')
 def get_spotify_token():
     session_id = request.args.get('session_id')
