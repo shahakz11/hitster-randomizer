@@ -1,7 +1,6 @@
 import os
 import re
-import time
-from flask import Flask, request, jsonify, redirect, g
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import requests
 import random
@@ -28,7 +27,6 @@ CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
 REDIRECT_URI = os.getenv('SPOTIFY_REDIRECT_URI')
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://preview--tune-twist-7ca04c74.base44.app')
 MONGO_URI = os.getenv('MONGO_URI')
-
 if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, MONGO_URI]):
     missing = [k for k, v in {
         'SPOTIFY_CLIENT_ID': CLIENT_ID,
@@ -38,6 +36,7 @@ if not all([CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, MONGO_URI]):
     }.items() if not v]
     logger.error(f"Missing environment variables: {missing}")
     raise ValueError(f"Missing environment variables: {missing}")
+logger.info(f"Environment: REDIRECT_URI={REDIRECT_URI}, FRONTEND_URL={FRONTEND_URL}")
 
 # Valid icon names for playlists
 VALID_ICONS = [
@@ -46,129 +45,425 @@ VALID_ICONS = [
 ]
 DEFAULT_ICON = 'music-note'
 
-# MongoDB setup with fork-safe configuration
-mongodb = None
+# MongoDB setup
+try:
+    mongodb = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=30000,
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000,
+        retryWrites=True,
+        w='majority'
+    )
+    db = mongodb['hitster']
+    sessions = db['sessions']
+    tracks = db['tracks']
+    playlists = db['playlists']
+    playlist_tracks = db['playlist_tracks']
+    track_metadata = db['track_metadata']
+    mongodb.admin.command('ping')  # Test connection
+    # Create TTL index on tracks.expires_at for 2-hour expiry
+    tracks.create_index(
+        [("expires_at", 1)],
+        expireAfterSeconds=7200,
+        partialFilterExpression={"expires_at": {"$exists": True}}
+    )
+    # Create index on playlist_id for playlist_tracks
+    playlist_tracks.create_index([("playlist_id", 1)], unique=True)
+    # Create unique index on track_name and artist_name for track_metadata
+    track_metadata.create_index([("track_name", 1), ("artist_name", 1)], unique=True)
+    logger.info("MongoDB connected successfully and indexes ensured")
+except Exception as e:
+    logger.error(f"MongoDB connection or index creation failed: {e}")
+    raise
 
-def init_db():
-    global mongodb
+# Get Client Credentials access token
+def get_client_credentials_token():
     try:
-        mongodb = MongoClient(
-            MONGO_URI,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=30000,
-            maxPoolSize=10,
-            retryWrites=True,
-            retryReads=True,
-            connect=False  # Critical for fork safety
+        response = requests.post(
+            'https://accounts.spotify.com/api/token',
+            data={'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}
         )
+        response.raise_for_status()
+        return response.json().get('access_token')
+    except requests.RequestException as e:
+        logger.error(f"Error getting client credentials token: {e}, Response: {response.text if 'response' in locals() else 'No response'}")
+        return None
+
+# Refresh Authorization Code access token
+def refresh_access_token(session_id):
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session or not session.get('spotify_refresh_token'):
+            logger.error(f"No refresh token for session {session_id}")
+            return False
+        response = requests.post(
+            'https://accounts.spotify.com/api/token',
+            data={
+                'grant_type': 'refresh_token',
+                'refresh_token': session['spotify_refresh_token'],
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET
+            }
+        )
+        response.raise_for_status()
+        data = response.json()
+        expires_in = data.get('expires_in', 3600)
+        result = sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$set': {
+                'spotify_access_token': data.get('access_token'),
+                'token_expires_at': datetime.utcnow() + timedelta(seconds=expires_in)
+            }}
+        )
+        logger.info(f"Refreshed access token for session {session_id}, modified: {result.modified_count}")
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Error refreshing access token for {session_id}: {e}, Response: {response.text if 'response' in locals() else 'No response'}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error in refresh_access_token for {session_id}: {e}")
+        return False
+
+# Fetch original release year from MusicBrainz
+def get_original_release_year(track_name, artist_name, album_name, fallback_year):
+    # Validate fallback year
+    if fallback_year < 1900 or fallback_year > datetime.utcnow().year:
+        logger.warning(f"Invalid Spotify fallback year {fallback_year} for {track_name} by {artist_name}, using current year")
+        fallback_year = datetime.utcnow().year
+    
+    # Check cache first
+    cached = track_metadata.find_one({'track_name': track_name, 'artist_name': artist_name})
+    if cached and cached.get('expires_at') > datetime.utcnow():
+        logger.info(f"Using cached original year for {track_name} by {artist_name}: {cached['original_year']}")
+        return cached['original_year']
+    
+    try:
+        # Query MusicBrainz release endpoint
+        query = f'release:"{album_name}" AND artist:"{artist_name}"'
+        response = requests.get(
+            f'https://musicbrainz.org/ws/2/release?query={urlencode({"query": query})}&fmt=json',
+            headers={'User-Agent': 'HitsterRandomizer/1.0 ( https://hitster-randomizer.onrender.com )'}
+        )
+        response.raise_for_status()
+        data = response.json()
+        logger.debug(f"MusicBrainz release response for {track_name} by {artist_name} (album: {album_name}): {data}")
         
-        # Verify connection works
-        mongodb.admin.command('ping')
-        logger.info("MongoDB connected successfully")
+        earliest_year = fallback_year
+        found_valid_year = False
         
-        db = mongodb['hitster']
+        # Check releases for date field
+        for release in data.get('releases', []):
+            if 'date' in release and release['date']:
+                try:
+                    year = int(release['date'].split('-')[0])
+                    # Only accept reasonable years (post-1900)
+                    if 1900 <= year <= datetime.utcnow().year:
+                        if year < earliest_year or not found_valid_year:
+                            earliest_year = year
+                            found_valid_year = True
+                except ValueError:
+                    logger.warning(f"Invalid date format in release for {track_name} by {artist_name}: {release['date']}")
+                    continue
         
-        # Create indexes with error handling
-        try:
-            db.sessions.create_index(
-                [("state", 1)],
-                unique=True,
-                partialFilterExpression={"state": {"$type": "string"}}
+        # Fallback to track-based search if no valid year found
+        if not found_valid_year:
+            query = f'recording:"{track_name}" AND artist:"{artist_name}"'
+            response = requests.get(
+                f'https://musicbrainz.org/ws/2/recording?query={urlencode({"query": query})}&fmt=json',
+                headers={'User-Agent': 'HitsterRandomizer/1.0 ( https://hitster-randomizer.onrender.com )'}
             )
-            db.sessions.create_index(
-                [("token_expires_at", 1)],
-                expireAfterSeconds=0
-            )
-            logger.info("MongoDB indexes ensured")
-        except Exception as e:
-            logger.warning(f"Index creation warning: {str(e)}")
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"MusicBrainz recording fallback response for {track_name} by {artist_name}: {data}")
             
-        return db
+            for recording in data.get('recordings', []):
+                if 'first-release-date' in recording and recording['first-release-date']:
+                    try:
+                        year = int(recording['first-release-date'].split('-')[0])
+                        if 1900 <= year <= datetime.utcnow().year:
+                            if year < earliest_year or not found_valid_year:
+                                earliest_year = year
+                                found_valid_year = True
+                    except ValueError:
+                        logger.warning(f"Invalid date format in recording for {track_name} by {artist_name}: {recording['first-release-date']}")
+                        continue
         
+        # Cache only if we found a valid year different from fallback
+        if found_valid_year and earliest_year != fallback_year:
+            track_metadata.update_one(
+                {'track_name': track_name, 'artist_name': artist_name},
+                {'$set': {
+                    'track_name': track_name,
+                    'artist_name': artist_name,
+                    'album_name': album_name,
+                    'original_year': earliest_year,
+                    'expires_at': datetime.utcnow() + timedelta(days=30)
+                }},
+                upsert=True
+            )
+            logger.info(f"Cached original year {earliest_year} for {track_name} by {artist_name} (album: {album_name})")
+        else:
+            logger.warning(f"No valid year found for {track_name} by {artist_name} (album: {album_name}), using fallback: {fallback_year}")
+        
+        return earliest_year
     except Exception as e:
-        logger.error(f"MongoDB connection failed: {str(e)}")
-        raise
+        logger.error(f"Error fetching original year for {track_name} by {artist_name} (album: {album_name}): {e}")
+        return fallback_year  # Fallback to Spotify's year
 
-db = init_db()
-sessions = db['sessions']
-tracks = db['tracks']
-playlists = db['playlists']
-playlist_tracks = db['playlist_tracks']
-track_metadata = db['track_metadata']
-
-# Middleware
-@app.before_request
-def start_timer():
-    g.start_time = time.time()
-
-@app.before_request
-def check_db_connection():
+# Fetch playlist metadata
+def get_playlist_metadata(playlist_id):
+    cached = playlists.find_one({'playlist_id': playlist_id})
+    if cached and cached.get('expires_at') > datetime.utcnow():
+        return cached['name'], cached.get('custom_icon', DEFAULT_ICON), None
+    token = get_client_credentials_token()
+    if not token:
+        return None, None, "Failed to get client credentials token"
     try:
-        mongodb.admin.command('ping')
-    except Exception as e:
-        logger.critical(f"Database connection lost: {str(e)}")
-        return jsonify({"error": "Database unavailable"}), 503
-
-@app.after_request
-def log_request(response):
-    if request.path.startswith('/api/'):
-        duration = (time.time() - g.get('start_time', time.time())) * 1000
-        logger.info(
-            f"{request.method} {request.path} - {response.status_code} "
-            f"- {duration:.1f}ms"
+        response = requests.get(
+            f'https://api.spotify.com/v1/playlists/{playlist_id}?fields=name',
+            headers={'Authorization': f'Bearer {token}'}
         )
-    return response
+        if response.status_code == 401:
+            token = get_client_credentials_token()
+            if not token:
+                return None, None, "Failed to refresh client credentials token"
+            response = requests.get(
+                f'https://api.spotify.com/v1/playlists/{playlist_id}?fields=name',
+                headers={'Authorization': f'Bearer {token}'}
+            )
+        response.raise_for_status()
+        data = response.json()
+        name = data.get('name', 'Unknown Playlist')
+        result = playlists.update_one(
+            {'playlist_id': playlist_id},
+            {'$set': {
+                'playlist_id': playlist_id,
+                'name': name,
+                'custom_icon': DEFAULT_ICON,
+                'expires_at': datetime.utcnow() + timedelta(days=30),
+            }},
+            upsert=True
+        )
+        logger.info(f"Updated playlist metadata for {playlist_id}, modified: {result.modified_count}")
+        return name, DEFAULT_ICON, None
+    except requests.RequestException as e:
+        logger.error(f"Error fetching playlist {playlist_id}: {e}, Response: {response.text if 'response' in locals() else 'No response'}")
+        return None, None, str(e)
 
-# Spotify Authorization Flow
+# Fetch tracks from a playlist with caching
+def get_playlist_tracks(playlist_id, session_id):
+    # Check cache
+    cache = playlist_tracks.find_one({'playlist_id': playlist_id})
+    if cache and (datetime.utcnow() - cache['cached_at']).total_seconds() < 300:  # 5 minutes
+        tracks = cache['tracks']
+    else:
+        token = get_client_credentials_token()
+        if not token:
+            logger.error(f"No client credentials token for playlist {playlist_id}")
+            return []
+        tracks = []
+        offset = 0
+        limit = 50
+        while True:
+            response = requests.get(
+                f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit={limit}&offset={offset}',
+                headers={'Authorization': f'Bearer {token}'}
+            )
+            if response.status_code == 401:
+                token = get_client_credentials_token()
+                if not token:
+                    logger.error(f"Failed to refresh client credentials token for playlist {playlist_id}")
+                    return []
+                response = requests.get(
+                    f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit={limit}&offset={offset}',
+                    headers={'Authorization': f'Bearer {token}'}
+                )
+            response.raise_for_status()
+            data = response.json()
+            if 'items' not in data:
+                logger.error(f"No 'items' in response for playlist {playlist_id}, Response: {data}")
+                return []
+            new_tracks = [item['track'] for item in data['items'] if item['track'] and item['track']['id']]
+            tracks.extend(new_tracks)
+            if len(data['items']) < limit:
+                break
+            offset += limit
+        # Update cache
+        playlist_tracks.update_one(
+            {'playlist_id': playlist_id},
+            {'$set': {'tracks': tracks, 'cached_at': datetime.utcnow()}},
+            upsert=True
+        )
+    
+    session = sessions.find_one({'_id': ObjectId(session_id)})
+    if not session:
+        logger.error(f"Session {session_id} not found in get_playlist_tracks")
+        return []
+    played_track_ids = session.get('tracks_played', [])
+    unplayed_tracks = [track for track in tracks if track['id'] not in played_track_ids]
+    if not unplayed_tracks and tracks:
+        result = sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$set': {'tracks_played': []}}
+        )
+        logger.info(f"Reset tracks_played for session {session_id} for playlist {playlist_id}, modified: {result.modified_count}")
+        return tracks
+    if not unplayed_tracks:
+        logger.info(f"No unplayed tracks for playlist {playlist_id}, Total tracks: {len(tracks)}, Played tracks: {len(played_track_ids)}")
+        return unplayed_tracks
+    return unplayed_tracks
+
+# Check for active Spotify devices
+def get_active_device(session_id):
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session:
+            logger.error(f"Session {session_id} not found in get_active_device")
+            return None, "No session found"
+        if not session.get('spotify_access_token'):
+            logger.error(f"No access token for session {session_id}")
+            return None, "No access token available"
+        response = requests.get(
+            'https://api.spotify.com/v1/me/player/devices',
+            headers={'Authorization': f'Bearer {session["spotify_access_token"]}'}
+        )
+        if response.status_code == 401:
+            if refresh_access_token(session_id):
+                session = sessions.find_one({'_id': ObjectId(session_id)})
+                response = requests.get(
+                    'https://api.spotify.com/v1/me/player/devices',
+                    headers={'Authorization': f'Bearer {session["spotify_access_token"]}'}
+                )
+            else:
+                logger.error(f"Failed to refresh access token for session {session_id}")
+                return None, "Failed to refresh access token"
+        response.raise_for_status()
+        devices = response.json().get('devices', [])
+        for device in devices:
+            if device['is_active']:
+                return device['id'], None
+        return devices[0]['id'] if devices else None, "No active devices found. Open Spotify and play/pause a track."
+    except requests.RequestException as e:
+        logger.error(f"Error checking devices for session {session_id}: {e}, Response: {response.text if 'response' in locals() else 'No response'}")
+        return None, f"Error checking devices: {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error in get_active_device for {session_id}: {e}")
+        return None, f"Error checking devices: {str(e)}"
+
+# Play a track
+def play_track(track_id, session_id):
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session:
+            logger.error(f"Session {session_id} not found in play_track")
+            return False, "No session found"
+        if not session.get('spotify_access_token'):
+            logger.error(f"No access token for session {session_id}")
+            return False, "Error: No access token set"
+        device_id, error = get_active_device(session_id)
+        if not device_id:
+            return False, error or "Error: No active Spotify device found. Open Spotify and play/pause a track."
+        response = requests.put(
+            'https://api.spotify.com/v1/me/player/play',
+            headers={'Authorization': f'Bearer {session["spotify_access_token"]}', 'Content-Type': 'application/json'},
+            json={'uris': [f'spotify:track:{track_id}'], 'device_id': device_id}
+        )
+        if response.status_code == 401:
+            if refresh_access_token(session_id):
+                session = sessions.find_one({'_id': ObjectId(session_id)})
+                response = requests.put(
+                    'https://api.spotify.com/v1/me/player/play',
+                    headers={'Authorization': f'Bearer {session["spotify_access_token"]}', 'Content-Type': 'application/json'},
+                    json={'uris': [f'spotify:track:{track_id}'], 'device_id': device_id}
+                )
+            else:
+                return False, "Failed to refresh access token"
+        if response.status_code == 403:
+            return False, "Premium account required to play tracks."
+        logger.info(f"Play request status for session {session_id}: {response.status_code}, Response: {response.text}")
+        return response.status_code == 204, None
+    except requests.RequestException as e:
+        logger.error(f"Error playing track {track_id} for session {session_id}: {e}, Response: {response.text if 'response' in locals() else 'No response'}")
+        return False, f"Error playing track: {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error in play_track for {session_id}: {e}")
+        return False, f"Error playing track: {str(e)}"
+
+@app.route('/api/spotify/token')
+def get_spotify_token():
+    session_id = request.args.get('session_id')
+    if not session_id:
+        logger.error("No session_id provided in get_spotify_token")
+        return jsonify({'error': 'Session ID required'}), 400
+    try:
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session:
+            logger.error(f"Invalid session_id in get_spotify_token: {session_id}")
+            return jsonify({'error': 'Invalid session_id'}), 400
+        token = session.get('spotify_access_token')
+        if not token or (session.get('token_expires_at') and session['token_expires_at'] < datetime.utcnow()):
+            if not refresh_access_token(session_id):
+                logger.error(f"Failed to refresh token for session {session_id}")
+                return jsonify({'error': 'Authentication required'}), 401
+            session = sessions.find_one({'_id': ObjectId(session_id)})
+            token = session.get('spotify_access_token')
+        return jsonify({'access_token': token})
+    except Exception as e:
+        logger.error(f"Error in get_spotify_token for {session_id}: {e}")
+        return jsonify({'error': str(e)}), 400
+
+# Parse Spotify playlist URL
+def parse_playlist_url(url):
+    pattern = r'https?://open\.spotify\.com/playlist/([0-9a-zA-Z]{22})'
+    match = re.match(pattern, url)
+    if match:
+        return match.group(1)
+    return None
+
 @app.route('/api/spotify/authorize')
 def spotify_authorize():
     try:
         state = str(random.randint(100000, 999999))
-        
-        # Clean up any existing session with this state
-        sessions.delete_one({'state': state})
-        
-        # Create new session
-        session_id = sessions.insert_one({
-            'state': state,
-            'created_at': datetime.utcnow(),
-            'is_active': False,
-            'tracks_played': []
-        }).inserted_id
-        
         params = {
             'client_id': CLIENT_ID,
             'response_type': 'code',
             'redirect_uri': REDIRECT_URI,
             'state': state,
-            'scope': 'streaming user-read-playback-state user-modify-playback-state user-read-email',
-            'show_dialog': 'true'
+            'scope': 'streaming user-read-playback-state user-modify-playback-state'
         }
-        
+        session_id = str(sessions.insert_one({
+            'state': state,
+            'created_at': datetime.utcnow().isoformat(),
+            'is_active': False,
+            'user_playlists': []  # Initialize empty, as playlists are fetched from hitster.playlists
+        }).inserted_id)
+        logger.info(f"Authorizing with state: {state}, session_id: {session_id}")
         auth_url = f"https://accounts.spotify.com/authorize?{urlencode(params)}"
         return redirect(auth_url)
-        
     except Exception as e:
-        logger.error(f"Authorization failed: {str(e)}", exc_info=True)
-        return jsonify({"error": "Authorization setup failed"}), 500
+        logger.error(f"Error in spotify_authorize: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/spotify/callback')
 def spotify_callback():
     code = request.args.get('code')
     state = request.args.get('state')
     error = request.args.get('error')
-    
     if error:
-        logger.error(f"Spotify callback error: {error}")
-        return redirect(f"{FRONTEND_URL}?error={error}")
-    
+        logger.error(f"Spotify authorization error: {error}, state: {state}")
+        return redirect(f"{FRONTEND_URL}?error={urlencode({'error': error})}")
+    if not code or not state:
+        error_msg = f"Invalid code or state: code={code}, state={state}"
+        logger.error(error_msg)
+        return redirect(f"{FRONTEND_URL}?error={urlencode({'error': error_msg})}")
     try:
         session = sessions.find_one({'state': state, 'is_active': False})
         if not session:
-            logger.error(f"Invalid state: {state}")
-            return redirect(f"{FRONTEND_URL}?error=invalid_state")
-        
-        # Exchange code for token
+            error_msg = f"Invalid or used state: {state}"
+            logger.error(error_msg)
+            return redirect(f"{FRONTEND_URL}?error={urlencode({'error': error_msg})}")
+        session_id = str(session['_id'])
         response = requests.post(
             'https://accounts.spotify.com/api/token',
             data={
@@ -177,29 +472,43 @@ def spotify_callback():
                 'redirect_uri': REDIRECT_URI,
                 'client_id': CLIENT_ID,
                 'client_secret': CLIENT_SECRET
-            },
-            timeout=10
+            }
         )
-        response.raise_for_status()
+        if response.status_code != 200:
+            error_msg = f"Token exchange failed: status={response.status_code}, response={response.text}"
+            logger.error(error_msg)
+            return redirect(f"{FRONTEND_URL}?error={urlencode({'error': error_msg})}")
         data = response.json()
-        
-        # Update session
-        sessions.update_one(
-            {'_id': session['_id']},
+        expires_in = data.get('expires_in', 3600)
+        result = sessions.update_one(
+            {'_id': ObjectId(session_id)},
             {'$set': {
-                'spotify_access_token': data['access_token'],
-                'spotify_refresh_token': data['refresh_token'],
-                'token_expires_at': datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600)),
+                'spotify_access_token': data.get('access_token'),
+                'spotify_refresh_token': data.get('refresh_token'),
+                'token_expires_at': datetime.utcnow() + timedelta(seconds=expires_in),
+                'tracks_played': [],
                 'is_active': True,
-                'state': None  # Clear state after use
+                'playlist_theme': None,
+                'user_playlists': [],  # Empty, as playlists are fetched from hitster.playlists
+                'created_at': datetime.utcnow().isoformat(),
+                'state': None
             }}
         )
-        
-        return redirect(f"{FRONTEND_URL}?session_id={str(session['_id'])}")
-        
+        logger.info(f"Callback for session {session_id}, state: {state}, modified: {result.modified_count}")
+        session = sessions.find_one({'_id': ObjectId(session_id)})
+        if not session or not session.get('is_active'):
+            logger.error(f"Session {session_id} not updated correctly, session: {session}")
+            return redirect(f"{FRONTEND_URL}?error={urlencode({'error': 'Session update failed'})}")
+        logger.info(f"Callback success: session_id={session_id}, state={state}")
+        return redirect(f"{FRONTEND_URL}?session_id={session_id}")
+    except requests.RequestException as e:
+        error_msg = f"Error in spotify_callback: {str(e)}, Response: {response.text if 'response' in locals() else 'No response'}"
+        logger.error(error_msg)
+        return redirect(f"{FRONTEND_URL}?error={urlencode({'error': error_msg})}")
     except Exception as e:
-        logger.error(f"Callback failed: {str(e)}", exc_info=True)
-        return redirect(f"{FRONTEND_URL}?error=auth_failed")
+        error_msg = f"Unexpected error in spotify_callback: {str(e)}"
+        logger.error(error_msg)
+        return redirect(f"{FRONTEND_URL}?error={urlencode({'error': error_msg})}")
 
 @app.route('/api/spotify/add-playlist', methods=['POST'])
 def add_playlist():
@@ -252,207 +561,6 @@ def remove_playlist():
     except Exception as e:
         logger.error(f"Error in remove_playlist for {session_id}: {e}")
         return jsonify({'error': str(e)}), 400
-
-def get_playlist_tracks(playlist_id, session_id):
-    """Fetch tracks from a Spotify playlist"""
-    try:
-        session = sessions.find_one({'_id': ObjectId(session_id)})
-        if not session or not session.get('spotify_access_token'):
-            logger.error(f"No active session or access token for session {session_id}")
-            return None
-
-        headers = {
-            'Authorization': f"Bearer {session['spotify_access_token']}",
-            'Content-Type': 'application/json'
-        }
-
-        # First get the playlist to check if it's a user's playlist
-        playlist_url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
-        playlist_response = requests.get(playlist_url, headers=headers)
-        playlist_response.raise_for_status()
-        playlist_data = playlist_response.json()
-
-        # Get all tracks (handle pagination if needed)
-        tracks_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
-        tracks_response = requests.get(tracks_url, headers=headers)
-        tracks_response.raise_for_status()
-        tracks_data = tracks_response.json()
-
-        # Extract track items
-        track_items = []
-        if 'items' in tracks_data:
-            track_items = [item['track'] for item in tracks_data['items'] if item['track'] is not None]
-
-        logger.info(f"Fetched {len(track_items)} tracks from playlist {playlist_id}")
-        return track_items
-
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error fetching playlist tracks: {str(e)}")
-        if e.response.status_code == 401:
-            # Token might be expired, try to refresh
-            refresh_token(session_id)
-            return get_playlist_tracks(playlist_id, session_id)
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching playlist tracks: {str(e)}")
-        return None
-
-def refresh_token(session_id):
-    """Refresh Spotify access token"""
-    try:
-        session = sessions.find_one({'_id': ObjectId(session_id)})
-        if not session or not session.get('spotify_refresh_token'):
-            logger.error(f"No refresh token available for session {session_id}")
-            return False
-
-        response = requests.post(
-            'https://accounts.spotify.com/api/token',
-            data={
-                'grant_type': 'refresh_token',
-                'refresh_token': session['spotify_refresh_token'],
-                'client_id': CLIENT_ID,
-                'client_secret': CLIENT_SECRET
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        sessions.update_one(
-            {'_id': ObjectId(session_id)},
-            {'$set': {
-                'spotify_access_token': data['access_token'],
-                'token_expires_at': datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600))
-            }}
-        )
-        logger.info(f"Refreshed token for session {session_id}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to refresh token for session {session_id}: {str(e)}")
-        return False
-
-def get_original_release_year(track_name, artist_name, album_name, spotify_year):
-    """Get original release year (placeholder implementation)"""
-    # In a real implementation, you might query MusicBrainz here
-    return spotify_year
-
-def play_track(track_id, session_id):
-    """Play track on user's active Spotify device"""
-    try:
-        session = sessions.find_one({'_id': ObjectId(session_id)})
-        if not session or not session.get('spotify_access_token'):
-            return False, "No active session or access token"
-
-        headers = {
-            'Authorization': f"Bearer {session['spotify_access_token']}",
-            'Content-Type': 'application/json'
-        }
-
-        # First check available devices
-        devices_response = requests.get(
-            'https://api.spotify.com/v1/me/player/devices',
-            headers=headers
-        )
-        
-        if devices_response.status_code == 204:
-            return False, "No active devices found. Open Spotify on a device."
-
-        devices = devices_response.json().get('devices', [])
-        if not devices:
-            return False, "No active devices found. Open Spotify on a device."
-
-        # Play on first available device
-        play_response = requests.put(
-            f'https://api.spotify.com/v1/me/player/play?device_id={devices[0]["id"]}',
-            headers=headers,
-            json={'uris': [f'spotify:track:{track_id}']}
-        )
-
-        if play_response.status_code == 204:
-            return True, None
-        else:
-            return False, play_response.text
-
-    except Exception as e:
-        logger.error(f"Error playing track: {str(e)}")
-        return False, str(e)
-
-
-
-# Add this new endpoint to your server.py, right after the play_next_song endpoint:
-@app.route('/api/spotify/get-next-track/<playlist_id>')
-def get_next_track(playlist_id):
-    """
-    Get next track data without playing it (for SDK usage)
-    """
-    session_id = request.args.get('session_id')
-    if not session_id:
-        logger.error("No session_id provided in get_next_track")
-        return jsonify({'error': 'Session ID required'}), 400
-    
-    try:
-        session = sessions.find_one({'_id': ObjectId(session_id)})
-        if not session:
-            logger.error(f"Invalid session_id in get_next_track: {session_id}")
-            return jsonify({'error': 'Invalid session_id'}), 400
-        
-        # Update playlist theme
-        result = sessions.update_one(
-            {'_id': ObjectId(session_id)},
-            {'$set': {'playlist_theme': playlist_id}}
-        )
-        logger.info(f"Updated playlist_theme for session {session_id}, modified: {result.modified_count}")
-        
-        tracks_list = get_playlist_tracks(playlist_id, session_id)
-        if not tracks_list:
-            logger.error(f"No tracks available for playlist {playlist_id}")
-            return jsonify({'error': f'No tracks available for playlist {playlist_id}. Playlist may be empty or inaccessible.'}), 400
-        
-        random_track = random.choice(tracks_list)
-        
-        # Get track metadata
-        spotify_year = int(random_track['album']['release_date'].split('-')[0])
-        track_name = random_track['name']
-        artist_name = random_track['artists'][0]['name']
-        album_name = random_track['album']['name']
-        original_year = get_original_release_year(track_name, artist_name, album_name, spotify_year)
-        
-        # Store track data
-        tracks.insert_one({
-            'spotify_id': random_track['id'],
-            'title': track_name,
-            'artist': artist_name,
-            'album': album_name,
-            'release_year': original_year,
-            'playlist_theme': playlist_id,
-            'played_at': datetime.utcnow().isoformat(),
-            'session_id': str(session['_id']),
-            'expires_at': datetime.utcnow() + timedelta(hours=2)
-        })
-        
-        # Update tracks played
-        result = sessions.update_one(
-            {'_id': ObjectId(session_id)},
-            {'$push': {'tracks_played': random_track['id']}}
-        )
-        logger.info(f"Prepared track {random_track['id']} for session {session_id}, modified: {result.modified_count}")
-        
-        return jsonify({
-            'spotify_id': random_track['id'],
-            'title': track_name,
-            'artist': artist_name,
-            'release_year': original_year,
-            'album': album_name,
-            'playlist_theme': playlist_id,
-            'played_at': datetime.utcnow().isoformat(),
-            'track_uri': f"spotify:track:{random_track['id']}"  # This is what the SDK needs
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in get_next_track for {session_id}: {e}")
-        return jsonify({'error': str(e)}), 400
-
-
 
 @app.route('/api/spotify/update-playlist-icon', methods=['POST'])
 def update_playlist_icon():
@@ -656,6 +764,4 @@ def index():
     return jsonify({'message': 'Hitster Song Randomizer Backend. Use the frontend to interact.'})
 
 if __name__ == '__main__':
-    # Initialize DB connection when running directly
-    init_db()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
